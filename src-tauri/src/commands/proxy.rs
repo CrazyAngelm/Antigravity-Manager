@@ -275,6 +275,9 @@ pub async fn ensure_admin_server(
     // [NEW] 初始化全局图像思维模式配置
     crate::proxy::update_image_thinking_mode(config.image_thinking_mode.clone());
 
+    // Sync accounts to OpenClaw auth-profiles on proxy startup
+    crate::proxy::openclaw_sync::sync_openclaw_accounts();
+
     Ok(())
 }
 

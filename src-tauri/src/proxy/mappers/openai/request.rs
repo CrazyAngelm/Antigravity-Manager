@@ -294,6 +294,12 @@ pub fn transform_openai_request(
                                     // 这会与 v3.3.16 的 thinkingConfig 逻辑冲突，留待后续版本实现
                                     tracing::debug!("[OpenAI-Request] Skipping audio_url (not yet implemented in v3.3.16)");
                                 }
+                                OpenAIContentBlock::Unknown => {
+                                    // [FIX] Unknown content blocks are silently skipped.
+                                    // These should have been normalized in the pre-processing step.
+                                    // If we reach here, it's a truly unsupported type.
+                                    tracing::debug!("[OpenAI-Request] Skipping unknown content block type");
+                                }
                             }
                         }
                     }
@@ -589,6 +595,16 @@ pub fn transform_openai_request(
                 obj.remove("additionalProperties");
                 obj.remove("type"); // [NEW] Gemini 不支持在 FunctionDeclaration 根层级出现 type: "function"
                 obj.remove("external_web_access"); // [FIX #1278] Remove invalid field injected by OpenAI Codex
+
+                // [FIX] Rename input_schema -> parameters (Anthropic/Cursor tools format compatibility)
+                // Cursor sends tools with input_schema (Anthropic format) through OpenAI endpoint
+                if !obj.contains_key("parameters") {
+                    if let Some(schema) = obj.remove("input_schema") {
+                        obj.insert("parameters".to_string(), schema);
+                    }
+                } else {
+                    obj.remove("input_schema"); // Remove duplicate if both exist
+                }
             }
 
             if let Some(params) = gemini_func.get_mut("parameters") {

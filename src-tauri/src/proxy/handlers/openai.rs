@@ -82,8 +82,88 @@ pub async fn handle_chat_completions(
         }
     }
 
-    let mut openai_req: OpenAIRequest = serde_json::from_value(body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
+    // [FIX] Pre-process content blocks to normalize alternative image formats
+    // before serde deserialization. Handles:
+    //   - "input_image" with source.data (Anthropic/Claude format) → "image_url"
+    //   - "image" with source.data (Anthropic format) → "image_url"
+    //   - "input_image" with url/image_url string → "image_url"
+    if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        for msg in messages.iter_mut() {
+            if let Some(content) = msg.get_mut("content").and_then(|v| v.as_array_mut()) {
+                for block in content.iter_mut() {
+                    if let Some(block_type) = block.get("type").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                        match block_type.as_str() {
+                            "input_image" | "image" => {
+                                // Anthropic format: { type: "input_image", source: { type: "base64", media_type: "...", data: "..." } }
+                                // → OpenAI format: { type: "image_url", image_url: { url: "data:media_type;base64,data" } }
+                                // Extract all values as owned Strings before mutating block (borrow checker)
+                                let source_info: Option<(String, Option<String>, Option<String>)> = block.get("source").map(|source| {
+                                    let media_type = source.get("media_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("image/jpeg")
+                                        .to_string();
+                                    let data = source.get("data").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                    let url = source.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                    (media_type, data, url)
+                                });
+                                let flat_image_url = block.get("image_url").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                let flat_url = block.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                                if let Some((media_type, data, source_url)) = source_info {
+                                    if let Some(data) = data {
+                                        let data_url = format!("data:{};base64,{}", media_type, data);
+                                        *block = json!({
+                                            "type": "image_url",
+                                            "image_url": { "url": data_url }
+                                        });
+                                        debug!("[OpenAI-Pre] Normalized '{}' block → image_url (base64, {})", block_type, media_type);
+                                    } else if let Some(url) = source_url {
+                                        *block = json!({
+                                            "type": "image_url",
+                                            "image_url": { "url": url }
+                                        });
+                                        debug!("[OpenAI-Pre] Normalized '{}' block (source.url) → image_url", block_type);
+                                    }
+                                } else if let Some(url) = flat_image_url {
+                                    *block = json!({
+                                        "type": "image_url",
+                                        "image_url": { "url": url }
+                                    });
+                                    debug!("[OpenAI-Pre] Normalized '{}' block (string image_url) → image_url", block_type);
+                                } else if let Some(url) = flat_url {
+                                    *block = json!({
+                                        "type": "image_url",
+                                        "image_url": { "url": url }
+                                    });
+                                    debug!("[OpenAI-Pre] Normalized '{}' block (url field) → image_url", block_type);
+                                } else {
+                                    debug!("[OpenAI-Pre] WARNING: '{}' block has unrecognized structure: {:?}", block_type, block);
+                                }
+                            }
+                            _ => {} // Other types pass through to serde (Unknown variant catches them)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut openai_req: OpenAIRequest = serde_json::from_value(body.clone())
+        .map_err(|e| {
+            // [FIX] Log the deserialization error with request context for debugging
+            error!("[OpenAI-Handler] Failed to deserialize request: {}. Model: {:?}, Content types: {:?}",
+                e,
+                body.get("model").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                body.get("messages").and_then(|v| v.as_array()).map(|msgs| {
+                    msgs.iter().filter_map(|m| {
+                        m.get("content").and_then(|c| c.as_array()).map(|blocks| {
+                            blocks.iter().filter_map(|b| b.get("type").and_then(|t| t.as_str()).map(|s| s.to_string())).collect::<Vec<_>>()
+                        })
+                    }).flatten().collect::<Vec<_>>()
+                }).unwrap_or_default()
+            );
+            (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e))
+        })?;
 
     // Safety: Ensure messages is not empty
     if openai_req.messages.is_empty() {

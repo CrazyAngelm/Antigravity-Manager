@@ -78,6 +78,12 @@ pub enum OpenAIContentBlock {
     ImageUrl { image_url: OpenAIImageUrl },
     #[serde(rename = "audio_url")]
     AudioUrl { audio_url: AudioUrlContent },
+    // [FIX] Catch-all for unknown content types (e.g., "thinking", "tool_use", "file", etc.)
+    // Prevents deserialization failure when clients send unrecognized content blocks.
+    // NOTE: Known alternative image formats (input_image, image with source) are normalized
+    // to image_url in the pre-processing step in openai.rs before deserialization.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

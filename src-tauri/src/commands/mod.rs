@@ -44,6 +44,9 @@ pub async fn add_account(
     )
     .await;
 
+    // Sync to OpenClaw auth-profiles
+    crate::proxy::openclaw_sync::sync_openclaw_accounts();
+
     Ok(account)
 }
 
@@ -62,6 +65,9 @@ pub async fn delete_account(
 
     // Reload token pool
     let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
+
+    // Sync to OpenClaw auth-profiles
+    crate::proxy::openclaw_sync::sync_openclaw_accounts();
 
     Ok(())
 }
@@ -87,6 +93,9 @@ pub async fn delete_accounts(
 
     // Reload token pool
     let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
+
+    // Sync to OpenClaw auth-profiles
+    crate::proxy::openclaw_sync::sync_openclaw_accounts();
 
     Ok(())
 }

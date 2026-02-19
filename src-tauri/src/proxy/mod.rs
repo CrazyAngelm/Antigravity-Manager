@@ -17,6 +17,7 @@ pub mod handlers; // API 端点处理器
 pub mod mappers; // 协议转换器
 pub mod middleware; // Axum 中间件
 pub mod monitor; // 监控
+pub mod openclaw_sync; // OpenClaw auth-profiles sync
 pub mod opencode_sync; // OpenCode 配置同步
 pub mod providers; // Extra upstream providers (z.ai, etc.)
 pub mod proxy_pool; // 代理池管理器
