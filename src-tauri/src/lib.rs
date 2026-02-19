@@ -11,6 +11,68 @@ use modules::logger;
 use tracing::{info, warn, error};
 use std::sync::Arc;
 
+#[derive(Clone, Copy)]
+struct AppRuntimeFlags {
+    tray_enabled: bool,
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn is_wayland_session() -> bool {
+    std::env::var("WAYLAND_DISPLAY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|v| v.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+}
+
+fn should_enable_tray() -> bool {
+    if env_flag_enabled("ANTIGRAVITY_DISABLE_TRAY") {
+        info!("Tray disabled by ANTIGRAVITY_DISABLE_TRAY");
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if is_wayland_session() && !env_flag_enabled("ANTIGRAVITY_FORCE_TRAY") {
+            warn!(
+                "Linux Wayland session detected; disabling tray by default to avoid GTK/AppIndicator crashes. Set ANTIGRAVITY_FORCE_TRAY=1 to force-enable."
+            );
+            return false;
+        }
+    }
+
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_gdk_backend() {
+    if std::env::var("GDK_BACKEND").is_ok() {
+        return;
+    }
+
+    let is_wayland = is_wayland_session();
+    let has_x11_display = std::env::var("DISPLAY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let force_wayland = env_flag_enabled("ANTIGRAVITY_FORCE_WAYLAND");
+    let force_x11 = env_flag_enabled("ANTIGRAVITY_FORCE_X11");
+
+    if force_x11 || (is_wayland && has_x11_display && !force_wayland) {
+        // Force X11 backend under Wayland sessions to avoid a GTK Wayland shm crash.
+        std::env::set_var("GDK_BACKEND", "x11");
+        warn!(
+            "Forcing GDK_BACKEND=x11 for stability on Wayland. Set ANTIGRAVITY_FORCE_WAYLAND=1 to keep Wayland backend."
+        );
+    }
+}
+
 /// Increase file descriptor limit for macOS to prevent "Too many open files" errors
 #[cfg(target_os = "macos")]
 fn increase_nofile_limit() {
@@ -55,6 +117,9 @@ pub fn run() {
 
     // Initialize logger
     logger::init_logger();
+
+    #[cfg(target_os = "linux")]
+    configure_linux_gdk_backend();
 
     // Initialize token stats database
     if let Err(e) = modules::token_stats::init_db() {
@@ -222,6 +287,8 @@ pub fn run() {
         return;
     }
 
+    let tray_enabled = should_enable_tray();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -244,6 +311,7 @@ pub fn run() {
         }))
         .manage(commands::proxy::ProxyServiceState::new())
         .manage(commands::cloudflared::CloudflaredState::new())
+        .manage(AppRuntimeFlags { tray_enabled })
         .setup(|app| {
             info!("Setup starting...");
 
@@ -256,7 +324,9 @@ pub fn run() {
             #[cfg(target_os = "linux")]
             {
                 use tauri::Manager;
-                if let Some(window) = app.get_webview_window("main") {
+                if is_wayland_session() {
+                    info!("Linux Wayland session detected; skipping transparent window workaround");
+                } else if let Some(window) = app.get_webview_window("main") {
                     // Access GTK window and disable transparency at the GTK level
                     if let Ok(gtk_window) = window.gtk_window() {
                         use gtk::prelude::WidgetExt;
@@ -266,14 +336,19 @@ pub fn run() {
                             if let Some(visual) = screen.system_visual() {
                                 gtk_window.set_visual(Some(&visual));
                             }
+                            info!("Linux: Applied transparent window workaround");
                         }
-                        info!("Linux: Applied transparent window workaround");
                     }
                 }
             }
 
-            modules::tray::create_tray(app.handle())?;
-            info!("Tray created");
+            let runtime_flags = app.state::<AppRuntimeFlags>();
+            if runtime_flags.tray_enabled {
+                modules::tray::create_tray(app.handle())?;
+                info!("Tray created");
+            } else {
+                info!("Tray disabled for this session");
+            }
 
             // 立即启动管理服务器 (8045)，以便 Web 端能访问
             let handle = app.handle().clone();
@@ -323,13 +398,24 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                #[cfg(target_os = "macos")]
-                {
-                    use tauri::Manager;
-                    window.app_handle().set_activation_policy(tauri::ActivationPolicy::Accessory).unwrap_or(());
+                let tray_enabled = window
+                    .app_handle()
+                    .try_state::<AppRuntimeFlags>()
+                    .map(|flags| flags.tray_enabled)
+                    .unwrap_or(true);
+
+                if tray_enabled {
+                    let _ = window.hide();
+                    #[cfg(target_os = "macos")]
+                    {
+                        use tauri::Manager;
+                        window
+                            .app_handle()
+                            .set_activation_policy(tauri::ActivationPolicy::Accessory)
+                            .unwrap_or(());
+                    }
+                    api.prevent_close();
                 }
-                api.prevent_close();
             }
         })
         .invoke_handler(tauri::generate_handler![

@@ -114,16 +114,14 @@ pub fn resolve_request_config(
         _ => final_model,
     };
 
-    if enable_networking {
-        // [FIX] Only gemini-2.5-flash supports googleSearch tool
-        // All other models (including Gemini 3 Pro, thinking models, Claude aliases) must downgrade
-        if final_model != "gemini-2.5-flash" {
-            tracing::info!(
-                "[Common-Utils] Downgrading {} to gemini-2.5-flash for web search (only gemini-2.5-flash supports googleSearch)",
-                final_model
-            );
-            final_model = "gemini-2.5-flash".to_string();
-        }
+    // [FIX] Check allowlist before forcing downgrade
+    // If networking is enabled but the model doesn't support search, fall back to Flash
+    if enable_networking && !_is_high_quality_model {
+        tracing::info!(
+            "[Common-Utils] Downgrading {} to gemini-2.5-flash for web search (model not in search allowlist)",
+            final_model
+        );
+        final_model = "gemini-2.5-flash".to_string();
     }
 
     RequestConfig {
@@ -381,6 +379,7 @@ pub fn detects_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                     || n == "google_search"
                     || n == "web_search_20250305"
                     || n == "google_search_retrieval"
+                    || n == "builtin_web_search"
                 {
                     return true;
                 }
@@ -391,6 +390,7 @@ pub fn detects_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                     || t == "google_search"
                     || t == "web_search"
                     || t == "google_search_retrieval"
+                    || t == "builtin_web_search"
                 {
                     return true;
                 }
@@ -404,6 +404,7 @@ pub fn detects_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                         "google_search",
                         "web_search_20250305",
                         "google_search_retrieval",
+                        "builtin_web_search",
                     ];
                     if keywords.contains(&n) {
                         return true;
@@ -418,6 +419,7 @@ pub fn detects_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                         if n == "web_search"
                             || n == "google_search"
                             || n == "google_search_retrieval"
+                            || n == "builtin_web_search"
                         {
                             return true;
                         }
@@ -447,6 +449,7 @@ pub fn contains_non_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                     "google_search",
                     "web_search_20250305",
                     "google_search_retrieval",
+                    "builtin_web_search",
                 ];
                 if keywords.contains(&n) {
                     is_networking = true;
@@ -458,6 +461,7 @@ pub fn contains_non_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                         "google_search",
                         "web_search_20250305",
                         "google_search_retrieval",
+                        "builtin_web_search",
                     ];
                     if keywords.contains(&n) {
                         is_networking = true;
@@ -473,7 +477,7 @@ pub fn contains_non_networking_tool(tools: &Option<Vec<Value>>) -> bool {
                     for decl in decls {
                         if let Some(n) = decl.get("name").and_then(|v| v.as_str()) {
                             let keywords =
-                                ["web_search", "google_search", "google_search_retrieval"];
+                                ["web_search", "google_search", "google_search_retrieval", "builtin_web_search"];
                             if !keywords.contains(&n) {
                                 return true; // 发现本地函数
                             }

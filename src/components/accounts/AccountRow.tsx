@@ -58,7 +58,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
         switch (color) {
             case 'success': return 'text-emerald-500 dark:text-emerald-400';
             case 'warning': return 'text-amber-500 dark:text-amber-400';
-            default: return 'text-gray-400 dark:text-gray-500 opacity-60';
+            default: return 'text-blue-600 dark:text-blue-400';
         }
     };
 

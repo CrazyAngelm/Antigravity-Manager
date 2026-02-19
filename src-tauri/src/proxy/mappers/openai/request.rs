@@ -572,7 +572,10 @@ pub fn transform_openai_request(
 
             if let Some(name) = &name_opt {
                 // 跳过内置联网工具名称，避免重复定义
-                if name == "web_search" || name == "google_search" || name == "web_search_20250305"
+                if name == "web_search"
+                    || name == "google_search"
+                    || name == "web_search_20250305"
+                    || name == "builtin_web_search"
                 {
                     continue;
                 }

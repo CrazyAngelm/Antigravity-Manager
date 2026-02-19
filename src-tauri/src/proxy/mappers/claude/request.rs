@@ -382,7 +382,9 @@ pub fn transform_claude_request_in(
             tools.iter().any(|t| {
                 t.is_web_search()
                     || t.name.as_deref() == Some("google_search")
+                    || t.name.as_deref() == Some("builtin_web_search")
                     || t.type_.as_deref() == Some("web_search_20250305")
+                    || t.type_.as_deref() == Some("builtin_web_search")
             })
         })
         .unwrap_or(false);
@@ -422,15 +424,7 @@ pub fn transform_claude_request_in(
     // [IMPROVED] 提取 web search 模型为常量，便于维护
     const WEB_SEARCH_FALLBACK_MODEL: &str = "gemini-2.5-flash";
 
-    let mapped_model = if has_web_search_tool {
-        tracing::debug!(
-            "[Claude-Request] Web search tool detected, using fallback model: {}",
-            WEB_SEARCH_FALLBACK_MODEL
-        );
-        WEB_SEARCH_FALLBACK_MODEL.to_string()
-    } else {
-        crate::proxy::common::model_mapping::map_claude_model_to_gemini(&claude_req.model)
-    };
+    let mapped_model = crate::proxy::common::model_mapping::map_claude_model_to_gemini(&claude_req.model);
 
     // 将 Claude 工具转为 Value 数组以便探测联网
     let tools_val: Option<Vec<Value>> = claude_req.tools.as_ref().map(|list| {
@@ -478,15 +472,10 @@ pub fn transform_claude_request_in(
         is_thinking_enabled = false;
     }
 
-    // [New Strategy] 智能降级: 检查历史消息是否与 Thinking 模式兼容
-    // 如果处于未带 Thinking 的工具调用链中，必须临时禁用 Thinking
-    if is_thinking_enabled {
-        let should_disable = should_disable_thinking_due_to_history(&claude_req.messages);
-        if should_disable {
-            tracing::warn!("[Thinking-Mode] Automatically disabling thinking checks due to incompatible tool-use history (mixed application)");
-            is_thinking_enabled = false;
-        }
-    }
+    // [REMOVED] 智能降级检查 (should_disable_thinking_due_to_history)
+    // 原因: 该检查过于激进，会导致 Claude Code CLI 在历史记录不完美时永久禁用思考模式 (Issue #2006)
+    // 现在的策略是依赖 thinking_utils.rs 中的 Recovery 机制来修复历史，而不是禁用思考。
+
 
     // [FIX #295 & #298] If thinking enabled but no signature available,
     // disable thinking to prevent Gemini 3 Pro rejection
@@ -585,9 +574,15 @@ pub fn transform_claude_request_in(
         inner_request["generationConfig"] = generation_config;
     }
 
-
-    // [FIX] 确认不需要在根级别注入 thinking，由 generationConfig.thinkingConfig 统一处理
-    // root-level thinking injection removed
+    if let Some(tools_val) = tools {
+        inner_request["tools"] = tools_val;
+        // 显式设置工具配置模式为 VALIDATED
+        inner_request["toolConfig"] = json!({
+            "functionCallingConfig": {
+                "mode": "VALIDATED"
+            }
+        });
+    }
 
 
     // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
@@ -661,37 +656,7 @@ pub fn transform_claude_request_in(
     Ok(body)
 }
 
-/// 检查是否因为历史消息原因需要禁用 Thinking
-///
-/// 场景: 如果最后一条 Assistant 消息处于 Tool Use 流程中，但没有 Thinking 块，
-/// 说明这是一个由非 Thinking 模型发起的流程。此时强制开启 Thinking 会导致:
-/// "final assistant message must start with a thinking block" 错误。
-/// 我们无法伪造合法的 Thinking (因为签名问题)，唯一的解法是本轮请求暂时禁用 Thinking。
-fn should_disable_thinking_due_to_history(messages: &[Message]) -> bool {
-    // 逆序查找最后一条 Assistant 消息
-    for msg in messages.iter().rev() {
-        if msg.role == "assistant" {
-            if let MessageContent::Array(blocks) = &msg.content {
-                let has_tool_use = blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-                let has_thinking = blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::Thinking { .. }));
 
-                // 如果有工具调用，但没有 Thinking 块 -> 不兼容
-                if has_tool_use && !has_thinking {
-                    tracing::info!("[Thinking-Mode] Detected ToolUse without Thinking in history. Requesting disable.");
-                    return true;
-                }
-            }
-            // 只要找到最近的一条 Assistant 消息就结束检查
-            // 因为验证规则主要针对当前的闭环状态
-            return false;
-        }
-    }
-    false
-}
 
 /// Check if thinking mode should be enabled by default for a given model
 ///
@@ -1671,7 +1636,10 @@ fn build_tools(tools: &Option<Vec<Tool>>, has_web_search: bool) -> Result<Option
 
             // 2. Detect by name
             if let Some(name) = &tool.name {
-                if name == "web_search" || name == "google_search" {
+                if name == "web_search"
+                    || name == "google_search"
+                    || name == "builtin_web_search"
+                {
                     has_google_search = true;
                     continue;
                 }
@@ -1791,16 +1759,9 @@ fn build_generation_config(
         let effort = claude_req.output_config.as_ref().and_then(|c| c.effort.as_ref())
             .or_else(|| claude_req.thinking.as_ref().and_then(|t| t.effort.as_ref()));
 
-    // Thinking 配置
-    // Thinking 配置
-    // [FIX] 合并后的逻辑，移除重复的 if is_thinking_enabled
-    let mut thinking_config = json!({"includeThoughts": true});
-    let lower_mapped = mapped_model.to_lowercase();
-
-        // [FIX] 针对 Gemini 2.x 设置 thinkingBudget, 对于 3.x 设置 thinkingLevel
-        // 注意：目前 v1internal 接口对 3.x 预览版可能也需要特定的映射
         if should_use_adaptive {
             // [FIX #1825] Claude 4.6+ adaptive 模式下映射为动态预算或分级思维
+            let lower_mapped = mapped_model.to_lowercase();
             if lower_mapped.contains("gemini-3") {
                 // Gemini 3.x 支持分级指标格式，联动用户选择的强度
                 let mapped_level = match effort.map(|e| e.to_lowercase()).as_deref() {
@@ -1811,35 +1772,25 @@ fn build_generation_config(
                 };
                 tracing::debug!("[Claude-Request] Mapping adaptive mode to thinkingLevel: {} for Gemini 3 model", mapped_level);
                 thinking_config["thinkingLevel"] = json!(mapped_level);
-            } else if lower_mapped.contains("claude") {
-                // [FIX] Claude 模型不支持 -1，强制使用 16000
-                tracing::debug!("[Claude-Request] Mapping adaptive mode to fixed budget (16000) for Claude model");
-                thinking_config["thinkingBudget"] = json!(16000);
             } else {
-                // Gemini 2.x 支持通过 -1 开启原生全量动态预算
-                tracing::debug!("[Claude-Request] Mapping adaptive mode to dynamic budget (-1) for Gemini model");
-                thinking_config["thinkingBudget"] = json!(-1);
+                // [FIX #2007] Cherry Studio / Claude Protocol 400 Error Fix
+                // Gemini 1.5/2.0 models via Vertex AI often reject thinkingBudget: -1 (Adaptive) with 400 Invalid Argument
+                // especially when maxOutputTokens is high.
+                // We align with OpenAI mapper behavior: use 24576 as safe adaptive budget.
+                tracing::debug!("[Claude-Request] Mapping adaptive mode to safe budget (24576) for Gemini model");
+                thinking_config["thinkingBudget"] = json!(24576);
             }
             
-            // 针对自适应模式，如果没有显式设置，确保 maxOutputTokens 给足空间 (默认 131072)
+            // 针对自适应模式，如果没有显式设置，确保 maxOutputTokens 给足空间
+            // OpenAI mapper uses 57344 (24576 + 32768), we normally use 64k limit.
             if config.get("maxOutputTokens").is_none() {
-                config["maxOutputTokens"] = json!(131072);
+                config["maxOutputTokens"] = json!(64000);
             }
         } else {
-            // 固定预算模式
-            let mut budget = claude_req.thinking.as_ref().and_then(|t| t.budget_tokens).unwrap_or(16000);
-            
-            // [FIX] 如果 Claude 模型传入了 <= 0 的预算（可能是某些客户端的默认行为），修正为 16000
-            if lower_mapped.contains("claude") && budget <= 0 {
-                budget = 16000;
-            }
-            
             thinking_config["thinkingBudget"] = json!(budget);
         }
         
-        // [FIX] 统一注入到 generationConfig.thinkingConfig
         config["thinkingConfig"] = thinking_config;
-
     }
 
     // 其他参数
@@ -1864,7 +1815,7 @@ fn build_generation_config(
     let mut final_max_tokens: Option<i64> = claude_req.max_tokens.map(|t| t as i64);
 
     // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
-    // [NEW] 针对 Claude 4.6 adaptive 模式扩充默认上限到 128K
+    // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
     let model_lower = mapped_model.to_lowercase();
     // 重新计算 should_use_adaptive (因为上面定义的作用域仅在其 if 块内有效，或者我们可以假设在这里也需要同样的逻辑)
     // 但为了简洁和解耦，我们这里重新从 config 读取
@@ -1873,13 +1824,11 @@ fn build_generation_config(
     let req_adaptive = claude_req.thinking.as_ref().map(|t| t.type_ == "adaptive").unwrap_or(false);
     
     let is_adaptive_effective = (req_adaptive || global_adaptive) && model_lower.contains("claude");
-    let final_overhead = if is_adaptive_effective { 131072 } else { 32768 };
+    // [FIX] Lower default overhead to keep total under 65536
+    let final_overhead = if is_adaptive_effective { 64000 } else { 32768 };
 
     if let Some(thinking_config) = config.get("thinkingConfig") {
-        if is_adaptive_effective {
-             // [FIX] Adaptive mode: enforce large context window (128k) regardless of the shim budget
-             final_max_tokens = Some(final_overhead as i64);
-        } else if let Some(budget) = thinking_config
+        if let Some(budget) = thinking_config
             .get("thinkingBudget")
             .and_then(|t| t.as_u64())
         {
@@ -1908,7 +1857,18 @@ fn build_generation_config(
 
 
     if let Some(val) = final_max_tokens {
-        config["maxOutputTokens"] = json!(val);
+        // [FIX] Cap maxOutputTokens to 65536 to avoid INVALID_ARGUMENT (Cherry Studio sends 128000)
+        // Gemini models typically support max 8192 or 65536 output tokens. 128k is usually invalid.
+        let safe_limit = 65536;
+        if val > safe_limit {
+            tracing::warn!(
+                "[Generation-Config] Capping maxOutputTokens from {} to {} to prevent 400 Invalid Argument",
+                val, safe_limit
+            );
+            config["maxOutputTokens"] = json!(safe_limit);
+        } else {
+            config["maxOutputTokens"] = json!(val);
+        }
     }
 
     // [优化] 设置全局停止序列,防止模型幻觉出对话标记
@@ -2876,7 +2836,7 @@ mod tests {
 
         // Check injection
         assert_eq!(thinking_config["includeThoughts"], true);
-        assert_eq!(thinking_config["thinkingBudget"], 16000);
+        assert_eq!(thinking_config["thinkingBudget"], -1);
         assert!(thinking_config.get("thinkingType").is_none());
         assert!(thinking_config.get("effort").is_none());
 

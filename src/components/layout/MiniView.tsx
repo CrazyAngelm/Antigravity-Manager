@@ -70,7 +70,7 @@ export default function MiniView() {
                 }
             } else {
                 // Fallback for web mode if needed, or import from package.json
-                setAppVersion('4.1.10');
+                setAppVersion('4.1.21');
             }
         };
         fetchVersion();
@@ -176,7 +176,7 @@ export default function MiniView() {
                 <div className="flex justify-between items-baseline">
                     <span className="text-xs font-medium text-gray-600 dark:text-gray-400">{displayName}</span>
                     <div className="flex items-center gap-2">
-                        <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono">
+                        <span className="text-[10px] text-blue-600 dark:text-blue-400 font-mono">
                             {model.reset_time ? `R: ${formatTimeRemaining(model.reset_time)}` : t('common.unknown')}
                         </span>
                         <span className={clsx("text-xs font-bold", getStatusColor(model.percentage))}>
